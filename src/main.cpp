@@ -1,6 +1,8 @@
 // CYD HMI for Pulse — LVGL-based dashboard with WiFi/QR screen
 #include <Arduino.h>
+#include <SPI.h>
 #include <TFT_eSPI.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
 #include <lvgl.h>
 
@@ -9,10 +11,22 @@
 HardwareSerial HmiSerial(2);
 TFT_eSPI       tft = TFT_eSPI();
 
-#define TOUCH_IRQ  36
 #define BAUD_RATE  115200
 #define DISP_W     240
 #define DISP_H     320
+
+// XPT2046 resistive touch on its OWN SPI bus (CYD wiring, incl. 2-USB variant):
+// CLK=25, MISO=39, MOSI=32, CS=33. TFT_eSPI owns the other bus — its touch API
+// is unusable here, so we talk to the XPT2046 directly.
+#define TOUCH_CLK 25
+#define TOUCH_MISO 39
+#define TOUCH_MOSI 32
+#define TOUCH_CS 33
+#define TOUCH_Z_PRESS 400   // pressure above this = press
+#define TOUCH_Z_RELEASE 250 // pressure below this = release (hysteresis)
+#define LONG_PRESS_MS 2000  // hold anywhere → shutdown
+#define CAL_NAMESPACE "cyd_hmi"
+#define CAL_KEY "tcal"
 
 // ── Status ────────────────────────────────────────────────────────────────────
 
@@ -35,7 +49,8 @@ struct Status {
 void send_cmd(const char *cmd);
 void update_main_screen();
 void update_wifi_screen();
-void handle_touch_logic();
+void setup_touch();
+bool touch_suppressed();
 
 // ── LVGL display buffer ───────────────────────────────────────────────────────
 
@@ -52,13 +67,291 @@ void lvgl_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px) {
     lv_disp_flush_ready(drv);
 }
 
-// Touch: only IRQ pin, no coordinates — tap anywhere = click at screen center.
-void lvgl_touch_read(lv_indev_drv_t *, lv_indev_data_t *data) {
-    data->state   = (digitalRead(TOUCH_IRQ) == LOW) ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
-    data->point.x = DISP_W / 2;
-    data->point.y = DISP_H / 2;
+// ── Touch: XPT2046 driver on a dedicated SPI bus ─────────────────────────────
+
+static SPIClass touchSPI(HSPI); // TFT_eSPI uses the other bus (13/14/12)
+static Preferences prefs;
+static uint16_t touch_cal[5] = {300, 3600, 300, 3600, 0x03}; // x0,dx,y0,dy,flags
+
+static uint16_t tp_x = DISP_W / 2; // last in-range pointer position
+static uint16_t tp_y = DISP_H / 2;
+static bool tp_down = false;
+static uint32_t tp_t0 = 0;
+static bool tp_swallow_click = false; // click that ended a long press
+
+bool touch_suppressed() { return tp_swallow_click; }
+
+// One 12-bit conversion. cmd: 0x90=X, 0xD0=Y, 0xB0=Z1, 0xC0=Z2.
+static uint16_t tp_cmd(uint8_t cmd)
+{
+  touchSPI.beginTransaction(SPISettings(2500000, MSBFIRST, SPI_MODE0));
+  digitalWrite(TOUCH_CS, LOW);
+  touchSPI.transfer(cmd);
+  uint16_t v = touchSPI.transfer16(0x00);
+  digitalWrite(TOUCH_CS, HIGH);
+  touchSPI.endTransaction();
+  return v >> 3;
 }
 
+static void tp_hw_init()
+{
+  pinMode(TOUCH_CS, OUTPUT);
+  digitalWrite(TOUCH_CS, HIGH);
+  touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+}
+
+// Pressure: Z1 + 4095 - Z2 (same formula XPT2046_Touchscreen uses)
+static uint16_t tp_read_z()
+{
+  uint16_t z = (uint16_t)(tp_cmd(0xB0) + 4095) - tp_cmd(0xC0);
+  return (z >= 4095) ? 0 : z;
+}
+
+static void tp_read_raw(uint16_t *x, uint16_t *y)
+{
+  tp_cmd(0x90); // first conversion after idle is unreliable
+  *x = tp_cmd(0x90);
+  *y = tp_cmd(0xD0);
+}
+
+// Raw → screen, using calibration: {x0, dx, y0, dy, rot|invx<<1|invy<<2}
+static void tp_convert(uint16_t *x, uint16_t *y)
+{
+  uint16_t xx, yy;
+  if (!(touch_cal[4] & 0x01))
+  {
+    xx = (uint16_t)((*x - touch_cal[0]) * (uint32_t)DISP_W / touch_cal[1]);
+    yy = (uint16_t)((*y - touch_cal[2]) * (uint32_t)DISP_H / touch_cal[3]);
+  }
+  else
+  { // touch axes swapped vs. screen
+    xx = (uint16_t)((*y - touch_cal[0]) * (uint32_t)DISP_W / touch_cal[1]);
+    yy = (uint16_t)((*x - touch_cal[2]) * (uint32_t)DISP_H / touch_cal[3]);
+  }
+  if (touch_cal[4] & 0x02)
+    xx = DISP_W - 1 - xx;
+  if (touch_cal[4] & 0x04)
+    yy = DISP_H - 1 - yy;
+  *x = xx;
+  *y = yy;
+}
+
+static bool cal_load()
+{
+  if (!prefs.begin(CAL_NAMESPACE, true))
+    return false;
+  size_t n = prefs.getBytes(CAL_KEY, touch_cal, sizeof(touch_cal));
+  prefs.end();
+  return n == sizeof(touch_cal);
+}
+
+static void cal_save()
+{
+  if (!prefs.begin(CAL_NAMESPACE, false))
+    return;
+  prefs.putBytes(CAL_KEY, touch_cal, sizeof(touch_cal));
+  prefs.end();
+}
+
+static void tp_wait_release()
+{
+  while (tp_read_z() > 50)
+    delay(10);
+  delay(100);
+}
+
+// Wait for a firm press, average 8 raw samples. 20 s timeout per corner.
+static bool tp_wait_corner(uint16_t *x, uint16_t *y)
+{
+  uint32_t t0 = millis();
+  while (millis() - t0 < 20000)
+  {
+    if (tp_read_z() > TOUCH_Z_PRESS)
+    {
+      uint32_t sx = 0, sy = 0;
+      for (int i = 0; i < 8; i++)
+      {
+        uint16_t rx, ry;
+        tp_read_raw(&rx, &ry);
+        sx += rx;
+        sy += ry;
+        delay(2);
+      }
+      *x = sx / 8;
+      *y = sy / 8;
+      return true;
+    }
+    delay(5);
+  }
+  return false;
+}
+
+// Corner-tap calibration (same math as TFT_eSPI::calibrateTouch).
+static void cal_run()
+{
+  const uint8_t size = 20;
+  int16_t values[8]; // 4 corners × (x,y): UL, BL, UR, BR
+
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("TOUCH CALIBRATION", DISP_W / 2, 6, 2);
+    tft.drawCentreString("tap the highlighted corner", DISP_W / 2, 24, 2);
+    switch (i)
+    {
+    case 0: // up left
+      tft.drawLine(0, 0, 0, size, TFT_YELLOW);
+      tft.drawLine(0, 0, size, 0, TFT_YELLOW);
+      tft.drawLine(0, 0, size, size, TFT_YELLOW);
+      break;
+    case 1: // bottom left
+      tft.drawLine(0, DISP_H - size - 1, 0, DISP_H - 1, TFT_YELLOW);
+      tft.drawLine(0, DISP_H - 1, size, DISP_H - 1, TFT_YELLOW);
+      tft.drawLine(size, DISP_H - size - 1, 0, DISP_H - 1, TFT_YELLOW);
+      break;
+    case 2: // up right
+      tft.drawLine(DISP_W - size - 1, 0, DISP_W - 1, 0, TFT_YELLOW);
+      tft.drawLine(DISP_W - size - 1, size, DISP_W - 1, 0, TFT_YELLOW);
+      tft.drawLine(DISP_W - 1, size, DISP_W - 1, 0, TFT_YELLOW);
+      break;
+    case 3: // bottom right
+      tft.drawLine(DISP_W - size - 1, DISP_H - size - 1, DISP_W - 1, DISP_H - 1, TFT_YELLOW);
+      tft.drawLine(DISP_W - 1, DISP_H - 1 - size, DISP_W - 1, DISP_H - 1, TFT_YELLOW);
+      tft.drawLine(DISP_W - 1 - size, DISP_H - 1, DISP_W - 1, DISP_H - 1, TFT_YELLOW);
+      break;
+    }
+
+    tp_wait_release();
+    uint16_t x, y;
+    if (!tp_wait_corner(&x, &y))
+    {
+      tft.fillScreen(TFT_BLACK);
+      Serial.println("touch cal: TIMEOUT — no press detected");
+      return; // keep previous/default calibration
+    }
+    values[i * 2] = x;
+    values[i * 2 + 1] = y;
+    Serial.printf("touch cal: corner %u raw=%d,%d\n", i, x, y);
+  }
+
+  // Are touch axes swapped relative to the screen?
+  uint8_t rot = 0, invx = 0, invy = 0;
+  uint16_t x0, x1, y0, y1;
+  if (abs(values[0] - values[2]) > abs(values[1] - values[3]))
+  {
+    rot = 1;
+    x0 = (values[1] + values[3]) / 2;
+    x1 = (values[5] + values[7]) / 2;
+    y0 = (values[0] + values[4]) / 2;
+    y1 = (values[2] + values[6]) / 2;
+  }
+  else
+  {
+    x0 = (values[0] + values[2]) / 2;
+    x1 = (values[4] + values[6]) / 2;
+    y0 = (values[1] + values[5]) / 2;
+    y1 = (values[3] + values[7]) / 2;
+  }
+  if (x0 > x1)
+  {
+    uint16_t t = x0;
+    x0 = x1;
+    x1 = t;
+    invx = 1;
+  }
+  if (y0 > y1)
+  {
+    uint16_t t = y0;
+    y0 = y1;
+    y1 = t;
+    invy = 1;
+  }
+  x1 -= x0;
+  y1 -= y0;
+  if (x0 == 0)
+    x0 = 1;
+  if (x1 == 0)
+    x1 = 1;
+  if (y0 == 0)
+    y0 = 1;
+  if (y1 == 0)
+    y1 = 1;
+
+  touch_cal[0] = x0;
+  touch_cal[1] = x1;
+  touch_cal[2] = y0;
+  touch_cal[3] = y1;
+  touch_cal[4] = rot | (invx << 1) | (invy << 2);
+
+  tft.fillScreen(TFT_BLACK);
+  Serial.printf("touch cal: %u %u %u %u %u (saved)\n",
+                touch_cal[0], touch_cal[1], touch_cal[2], touch_cal[3], touch_cal[4]);
+  cal_save();
+}
+
+// Init hardware; load calibration from NVS, or run the corner-tap routine on
+// first boot / when the screen is held firmly at power-up.
+void setup_touch()
+{
+  tp_hw_init();
+  bool stored = cal_load();
+  delay(50);
+  bool held = (tp_read_z() > 2 * TOUCH_Z_PRESS);
+  if (stored && !held)
+  {
+    Serial.println("touch: calibration loaded from NVS");
+  }
+  else
+  {
+    Serial.println(held ? "touch: held at boot -> recalibrating"
+                        : "touch: no calibration stored -> calibrating");
+    cal_run();
+  }
+}
+
+void lvgl_touch_read(lv_indev_drv_t *, lv_indev_data_t *data)
+{
+  tp_swallow_click = false; // valid for this read cycle only
+
+  uint16_t z = tp_read_z();
+  bool down = tp_down ? (z > TOUCH_Z_RELEASE) : (z > TOUCH_Z_PRESS);
+
+  if (down)
+  {
+    uint16_t rx, ry;
+    tp_read_raw(&rx, &ry);
+    tp_convert(&rx, &ry);
+    if (rx < DISP_W && ry < DISP_H)
+    {
+      if (tp_down)
+      { // mild smoothing while sliding
+        tp_x = (uint16_t)((tp_x * 3 + rx) / 4);
+        tp_y = (uint16_t)((tp_y * 3 + ry) / 4);
+      }
+      else
+      {
+        tp_x = rx;
+        tp_y = ry;
+      }
+    }
+  }
+
+  if (down && !tp_down)
+  {
+    tp_t0 = millis();
+  }
+  else if (!down && tp_down && millis() - tp_t0 >= LONG_PRESS_MS)
+  {
+    send_cmd("shutdown");
+    tp_swallow_click = true; // do not toggle the widget under the finger
+  }
+  tp_down = down;
+
+  data->state = down ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+  data->point.x = tp_x;
+  data->point.y = tp_y;
+}
 // ── Screens ───────────────────────────────────────────────────────────────────
 
 static lv_obj_t *scr_main  = nullptr;
@@ -130,49 +423,6 @@ void init_styles() {
     lv_style_set_border_width(&style_btn_stop, 0);
 }
 
-// ── Button handler ────────────────────────────────────────────────────────────
-
-static unsigned long touch_start = 0;
-static bool          is_touching  = false;
-static unsigned long last_tap     = 0;
-
-void handle_touch_logic() {
-    bool touched = (digitalRead(TOUCH_IRQ) == LOW);
-    unsigned long now = millis();
-
-    if (touched && !is_touching) {
-        is_touching = true;
-        touch_start = now;
-    }
-
-    if (is_touching && !touched) {
-        uint32_t held = now - touch_start;
-        is_touching = false;
-
-        if (now - last_tap < 300) return;  // debounce
-        last_tap = now;
-
-        if (held >= 2000) {
-            // Long hold = shutdown
-            send_cmd("shutdown");
-            return;
-        }
-
-        if (on_wifi) {
-            // Any tap on wifi screen → back to main
-            lv_scr_load_anim(scr_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
-            on_wifi = false;
-            return;
-        }
-
-        // Short tap on main screen: toggle recording (if connected & sensors running)
-        bool connected = (millis() - status.last_rx < 2000);
-        if (connected && status.sensors_running) {
-            send_cmd(status.recording ? "stop_recording" : "start_recording");
-        }
-    }
-}
-
 // ── Protocol ──────────────────────────────────────────────────────────────────
 
 void send_cmd(const char *cmd) {
@@ -237,13 +487,12 @@ void build_main_screen() {
     lv_obj_set_style_text_color(lbl_wifi_icon, C_DIM, 0);
     lv_obj_align(lbl_wifi_icon, LV_ALIGN_RIGHT_MID, -12, 0);
     lv_obj_add_flag(lbl_wifi_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(lbl_wifi_icon, [](lv_event_t *e) {
-        if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-            update_wifi_screen();
-            lv_scr_load_anim(scr_wifi, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
-            on_wifi = true;
-        }
-    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(lbl_wifi_icon, [](lv_event_t *e)
+                        {
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED || touch_suppressed()) return;
+        update_wifi_screen();
+        lv_scr_load_anim(scr_wifi, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
+        on_wifi = true; }, LV_EVENT_CLICKED, nullptr);
 
     // Connection dot
     lbl_conn = lv_label_create(hdr);
@@ -278,7 +527,7 @@ void build_main_screen() {
 
     lbl_disk = lv_label_create(card_s);
     lv_label_set_text(lbl_disk, "DISK  -----  GB");
-    lv_obj_set_style_text_font(lbl_disk, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(lbl_disk, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(lbl_disk, C_DIM, 0);
     lv_obj_align(lbl_disk, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
@@ -302,13 +551,12 @@ void build_main_screen() {
     lv_obj_set_style_text_font(lbl_btn, &lv_font_montserrat_20, 0);
     lv_obj_center(lbl_btn);
 
-    lv_obj_add_event_cb(btn_rec, [](lv_event_t *e) {
-        if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-            bool connected = (millis() - status.last_rx < 2000);
-            if (connected && status.sensors_running)
-                send_cmd(status.recording ? "stop_recording" : "start_recording");
-        }
-    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_rec, [](lv_event_t *e)
+                        {
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED || touch_suppressed()) return;
+        bool connected = (millis() - status.last_rx < 2000);
+        if (connected && status.sensors_running)
+            send_cmd(status.recording ? "stop_recording" : "start_recording"); }, LV_EVENT_CLICKED, nullptr);
 }
 
 // ── WiFi screen ───────────────────────────────────────────────────────────────
@@ -363,6 +611,17 @@ void build_wifi_screen() {
     lv_obj_set_style_text_color(lbl_back, C_DIM, 0);
     lv_obj_set_style_text_font(lbl_back, &lv_font_montserrat_12, 0);
     lv_obj_align(lbl_back, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+    // Whole screen is the "back" button; children must not swallow the clicks
+    // (LVGL objects are clickable by default).
+    for (uint32_t i = 0; i < lv_obj_get_child_cnt(scr_wifi); i++)
+      lv_obj_clear_flag(lv_obj_get_child(scr_wifi, i), LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(scr_wifi, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(scr_wifi, [](lv_event_t *e)
+                        {
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED || touch_suppressed()) return;
+        lv_scr_load_anim(scr_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
+        on_wifi = false; }, LV_EVENT_CLICKED, nullptr);
 }
 
 // ── Screen updaters ───────────────────────────────────────────────────────────
@@ -387,8 +646,7 @@ void update_main_screen() {
         lv_label_set_text(lbl_imu,   "IMU    ---.-- Hz");
         lv_label_set_text(lbl_disk,  "DISK  -----  GB");
         lv_label_set_text(lbl_rec,   "");
-        lv_label_set_text(lbl_btn,   "WAITING...");
-        lv_obj_add_style(btn_rec, &style_btn_stop, 0);
+        lv_label_set_text(lbl_btn, "WAITING...");
         lv_obj_set_style_bg_color(btn_rec, lv_color_hex(0x2a2a2a), 0);
         return;
     }
@@ -463,10 +721,11 @@ void update_wifi_screen() {
     lv_label_set_text(lbl_qr_hint, "");
 
     if (!qr_url.isEmpty()) {
-        // QR code: 160x160, centered
-        qr_code = lv_qrcode_create(scr_wifi, 160, lv_color_hex(0x000000), lv_color_hex(0xffffff));
-        lv_qrcode_update(qr_code, qr_url.c_str(), qr_url.length());
-        lv_obj_align(qr_code, LV_ALIGN_CENTER, 0, 14);
+      // QR code: 200x200 (max size that fits between the labels), centered
+      qr_code = lv_qrcode_create(scr_wifi, 200, lv_color_hex(0x000000), lv_color_hex(0xffffff));
+      lv_qrcode_update(qr_code, qr_url.c_str(), qr_url.length());
+      lv_obj_align(qr_code, LV_ALIGN_CENTER, 0, 14);
+      lv_obj_clear_flag(qr_code, LV_OBJ_FLAG_CLICKABLE); // let taps reach the screen
     } else {
         lv_label_set_text(lbl_qr_hint, "No IP assigned");
     }
@@ -475,39 +734,40 @@ void update_wifi_screen() {
 // ── setup / loop ──────────────────────────────────────────────────────────────
 
 void setup() {
-    HmiSerial.begin(BAUD_RATE, SERIAL_8N1, 22, 27);
-    delay(100);
+  Serial.begin(BAUD_RATE); // diagnostics (UART0 via CH340C)
+  HmiSerial.begin(BAUD_RATE, SERIAL_8N1, 22, 27);
+  delay(100);
 
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH);
-    tft.init();
-    tft.setRotation(0);
-    tft.fillScreen(TFT_BLACK);
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  tft.init();
+  tft.setRotation(0);
+  tft.fillScreen(TFT_BLACK);
 
-    pinMode(TOUCH_IRQ, INPUT);
+  setup_touch(); // XPT2046 calibration from NVS (or corner-tap on first boot)
 
-    // Init LVGL
-    lv_init();
-    lv_disp_draw_buf_init(&draw_buf, lvgl_buf, nullptr, DISP_W * 30);
+  // Init LVGL
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buf, lvgl_buf, nullptr, DISP_W * 30);
 
-    static lv_disp_drv_t disp_drv;
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res    = DISP_W;
-    disp_drv.ver_res    = DISP_H;
-    disp_drv.flush_cb   = lvgl_flush;
-    disp_drv.draw_buf   = &draw_buf;
-    lv_disp_drv_register(&disp_drv);
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = DISP_W;
+  disp_drv.ver_res = DISP_H;
+  disp_drv.flush_cb = lvgl_flush;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
 
-    static lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type     = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb  = lvgl_touch_read;
-    lv_indev_drv_register(&indev_drv);
+  static lv_indev_drv_t indev_drv;
+  lv_indev_drv_init(&indev_drv);
+  indev_drv.type = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb = lvgl_touch_read;
+  lv_indev_drv_register(&indev_drv);
 
-    init_styles();
-    build_main_screen();
-    build_wifi_screen();
-    lv_scr_load(scr_main);
+  init_styles();
+  build_main_screen();
+  build_wifi_screen();
+  lv_scr_load(scr_main);
 }
 
 static unsigned long last_ui_update = 0;
@@ -524,16 +784,23 @@ void loop() {
         if (c == '\r') continue;
         if (c == '\n') {
             serial_buf.trim();
-            if (serial_buf.length() > 0 && serial_buf.charAt(0) == '{')
+            if (serial_buf.length() > 0)
+            {
+              if (serial_buf.charAt(0) == '{')
                 handle_json(serial_buf);
+              else
+                Serial.println("[HMI] " + serial_buf); // non-JSON line → log
+            }
             serial_buf = "";
         } else {
             serial_buf += c;
+            if (serial_buf.length() > 256)
+            { // guard against garbage stream
+              Serial.println("[HMI] " + serial_buf);
+              serial_buf = "";
+            }
         }
     }
-
-    // Touch handling (non-LVGL: long-press shutdown, screen switch)
-    handle_touch_logic();
 
     // Update screen ~2 Hz
     if (millis() - last_ui_update > 500) {

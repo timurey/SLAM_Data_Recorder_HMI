@@ -6,7 +6,7 @@ import json
 import time
 import sys
 
-PORT = '/dev/cu.usbserial-210'
+PORT = '/dev/cu.usbserial-0001'
 BAUD = 115200
 COUNT = 10
 INTERVAL = 0.5

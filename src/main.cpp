@@ -176,32 +176,34 @@ void handle_touch_logic() {
 // ── Protocol ──────────────────────────────────────────────────────────────────
 
 void send_cmd(const char *cmd) {
-    StaticJsonDocument<128> doc;
-    doc["cmd"] = cmd;
-    char buf[128];
-    size_t n = serializeJson(doc, buf);
-    buf[n] = '\0';
-    HmiSerial.print(buf);
-    HmiSerial.print('\n');
-    HmiSerial.flush();
+  JsonDocument doc;
+  doc["cmd"] = cmd;
+  char buf[128];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
+  buf[n] = '\0';
+  HmiSerial.print(buf);
+  HmiSerial.print('\n');
+  HmiSerial.flush();
 }
 
 void handle_json(const String &line) {
-    StaticJsonDocument<512> doc;
-    if (deserializeJson(doc, line)) return;
-    if (!doc["sensors_running"].is<bool>()) return;
-    status.sensors_running = doc["sensors_running"] | false;
-    status.lidar_hz        = doc["lidar_hz"]        | 0.0f;
-    status.imu_hz          = doc["imu_hz"]          | 0.0f;
-    status.lidar_ok        = doc["lidar_ok"]        | false;
-    status.imu_ok          = doc["imu_ok"]          | false;
-    status.recording       = doc["recording"]       | false;
-    status.disk_gb         = doc["disk_gb"]         | 0.0f;
-    status.rec_duration    = doc["rec_duration"]    | 0;
-    status.bag_name        = doc["bag_name"]        | "";
-    status.wifi_ip         = doc["wifi_ip"]         | "";
-    status.wifi_mode       = doc["wifi_mode"]       | "disconnected";
-    status.last_rx         = millis();
+  JsonDocument doc;
+  if (deserializeJson(doc, line))
+    return;
+  if (!doc["sensors_running"].is<bool>())
+    return;
+  status.sensors_running = doc["sensors_running"] | false;
+  status.lidar_hz = doc["lidar_hz"] | 0.0f;
+  status.imu_hz = doc["imu_hz"] | 0.0f;
+  status.lidar_ok = doc["lidar_ok"] | false;
+  status.imu_ok = doc["imu_ok"] | false;
+  status.recording = doc["recording"] | false;
+  status.disk_gb = doc["disk_gb"] | 0.0f;
+  status.rec_duration = doc["rec_duration"] | 0;
+  status.bag_name = doc["bag_name"] | "";
+  status.wifi_ip = doc["wifi_ip"] | "";
+  status.wifi_mode = doc["wifi_mode"] | "disconnected";
+  status.last_rx = millis();
 }
 
 // ── Main screen ───────────────────────────────────────────────────────────────
@@ -251,7 +253,7 @@ void build_main_screen() {
 
     // Sensors card
     lv_obj_t *card_s = lv_obj_create(scr_main);
-    lv_obj_set_size(card_s, DISP_W - 12, 90);
+    lv_obj_set_size(card_s, DISP_W - 12, 102);
     lv_obj_align(card_s, LV_ALIGN_TOP_MID, 0, 42);
     lv_obj_add_style(card_s, &style_card, 0);
 

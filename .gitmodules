@@ -1,0 +1,3 @@
+[submodule "lib/Cyd2UsbTouch"]
+	path = lib/Cyd2UsbTouch
+	url = https://github.com/timurey/Cyd2UsbTouch.git

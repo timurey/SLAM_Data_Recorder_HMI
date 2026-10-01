@@ -238,8 +238,12 @@ void build_main_screen()
   lv_obj_set_style_text_color(lbl_wifi_icon, C_DIM, 0);
   lv_obj_align(lbl_wifi_icon, LV_ALIGN_RIGHT_MID, -12, 0);
   lv_obj_add_flag(lbl_wifi_icon, LV_OBJ_FLAG_CLICKABLE);
-  // Navigation handled by manual touch poll in loop() — LVGL indev bypassed
-  lv_obj_add_event_cb(lbl_wifi_icon, [](lv_event_t *e) {}, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(lbl_wifi_icon, [](lv_event_t *e) {
+      if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+      update_wifi_screen();
+      on_wifi = true;
+      lv_scr_load_anim(scr_wifi, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+  }, LV_EVENT_CLICKED, nullptr);
 
   // Connection dot
   lbl_conn = lv_label_create(hdr);
@@ -331,8 +335,21 @@ void build_main_screen()
   lv_obj_set_style_text_color(lbl_btn, lv_color_hex(0x000000), 0);
   lv_obj_center(lbl_btn);
 
-  // Button click handled by manual touch poll in loop() (LVGL indev bypassed)
-  lv_obj_add_event_cb(btn_rec, [](lv_event_t *e) {}, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(btn_rec, [](lv_event_t *e) {
+      if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+      bool connected = (millis() - status.last_rx < 2000);
+      bool busy = status.laser_warming || pending_action != PendingAction::NONE;
+      if (!connected || !status.sensors_running || busy) return;
+      if (status.recording) {
+          send_cmd("stop_recording");
+          pending_action = PendingAction::STOPPING;
+      } else {
+          send_cmd("start_recording");
+          pending_action = PendingAction::STARTING;
+      }
+      pending_since = millis();
+      update_main_screen();
+  }, LV_EVENT_CLICKED, nullptr);
 }
 
 // ── WiFi screen ───────────────────────────────────────────────────────────────
@@ -359,6 +376,15 @@ void build_wifi_screen() {
     lv_obj_set_style_text_letter_space(lbl_hdr, 2, 0);
     lv_obj_set_style_text_font(lbl_hdr, &lv_font_montserrat_16, 0);
     lv_obj_align(lbl_hdr, LV_ALIGN_LEFT_MID, 12, 0);
+
+    // Tap header → back to main screen
+    lv_obj_add_flag(hdr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(hdr, [](lv_event_t *e) {
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+        on_wifi = false;
+        update_main_screen();
+        lv_scr_load_anim(scr_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+    }, LV_EVENT_CLICKED, nullptr);
 
     // Mode label
     lbl_wifi_mode = lv_label_create(scr_wifi);
@@ -396,6 +422,14 @@ void build_wifi_screen() {
     lv_obj_set_style_text_font(lbl_btn_wifi, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(lbl_btn_wifi, lv_color_hex(0x000000), 0);
     lv_obj_center(lbl_btn_wifi);
+
+    lv_obj_add_event_cb(btn_wifi_toggle, [](lv_event_t *e) {
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+        if (status.wifi_mode == "ap")
+            send_cmd("wifi_client");
+        else
+            send_cmd("wifi_ap");
+    }, LV_EVENT_CLICKED, nullptr);
 }
 
 // ── Screen updaters ───────────────────────────────────────────────────────────
@@ -607,93 +641,10 @@ void setup() {
 }
 
 static unsigned long last_ui_update = 0;
-static unsigned long wifi_screen_entered = 0; // millis() when WiFi screen opened
-static unsigned long last_tap_ms = 0;         // cooldown: ignore re-taps within 350ms
-static bool touch_was_down = false;
 static String serial_buf;
-
-// Main screen: rec button region (LV_ALIGN_BOTTOM_MID, 216×58, y=-12)
-static constexpr int BTN_X0 = 12, BTN_X1 = 228;
-static constexpr int BTN_Y0 = 250, BTN_Y1 = 308;
-// WiFi screen: toggle button region (LV_ALIGN_BOTTOM_MID, 216×50, y=-12)
-static constexpr int WIFI_BTN_X0 = 12, WIFI_BTN_X1 = 228;
-static constexpr int WIFI_BTN_Y0 = 258, WIFI_BTN_Y1 = 308;
 
 void loop() {
   lv_timer_handler();
-
-  // Touch poll — every loop iteration to catch short taps; cooldown prevents doubles
-  {
-    uint16_t z_raw = touch.readZ();
-    bool down = (z_raw > CYD_TOUCH_Z_PRESS);
-    if (down && !touch_was_down && (millis() - last_tap_ms > 350))
-    {
-      last_tap_ms = millis();
-      lv_indev_data_t tmp{};
-      touch.lvglRead(nullptr, &tmp);
-      uint16_t sx = tmp.point.x, sy = tmp.point.y;
-      Serial.printf("[TAP] z=%u x=%u y=%u\n", z_raw, sx, sy);
-      if (!on_wifi)
-      {
-        if (sx >= 170 && sy <= 40)
-        {
-          update_wifi_screen();
-          lv_obj_add_flag(scr_main, LV_OBJ_FLAG_HIDDEN);
-          lv_obj_clear_flag(scr_wifi, LV_OBJ_FLAG_HIDDEN);
-          lv_scr_load(scr_wifi);
-          lv_refr_now(NULL);
-          on_wifi = true;
-          wifi_screen_entered = millis();
-        }
-        else if (sx >= BTN_X0 && sx <= BTN_X1 && sy >= BTN_Y0 && sy <= BTN_Y1)
-        {
-          bool connected = (millis() - status.last_rx < 2000);
-          bool busy = status.laser_warming ||
-                      pending_action != PendingAction::NONE;
-          if (connected && status.sensors_running && !busy)
-          {
-            if (status.recording)
-            {
-              send_cmd("stop_recording");
-              pending_action = PendingAction::STOPPING;
-            }
-            else
-            {
-              send_cmd("start_recording");
-              pending_action = PendingAction::STARTING;
-            }
-            pending_since = millis();
-            update_main_screen();
-            lv_obj_invalidate(scr_main);
-            lv_timer_handler();
-          }
-        }
-      }
-      else
-      {
-        bool in_wifi_btn = (sx >= WIFI_BTN_X0 && sx <= WIFI_BTN_X1 &&
-                            sy >= WIFI_BTN_Y0 && sy <= WIFI_BTN_Y1);
-        if (in_wifi_btn)
-        {
-          // Send WiFi mode toggle command to Pi
-          if (status.wifi_mode == "ap")
-            send_cmd("wifi_client");
-          else
-            send_cmd("wifi_ap");
-        }
-        else if (millis() - wifi_screen_entered > 600)
-        {
-          on_wifi = false;
-          lv_obj_add_flag(scr_wifi, LV_OBJ_FLAG_HIDDEN);
-          lv_obj_clear_flag(scr_main, LV_OBJ_FLAG_HIDDEN);
-          update_main_screen();
-          lv_scr_load(scr_main);
-          lv_refr_now(NULL);
-        }
-      }
-    }
-    touch_was_down = down;
-  }
 
   // Serial input — drain the whole FIFO before yielding
   while (HmiSerial.available())
@@ -728,15 +679,13 @@ void loop() {
     }
   }
 
-  // Update screen at 200 ms + force hardware flush
+  // Update screen at 200 ms
   if (millis() - last_ui_update > 200)
   {
-    if (!on_wifi)
-    {
+    if (on_wifi)
+      update_wifi_screen();
+    else
       update_main_screen();
-      lv_obj_invalidate(scr_main);
-      lv_refr_now(NULL);
-    }
     last_ui_update = millis();
   }
 }

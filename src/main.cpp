@@ -686,6 +686,7 @@ void loop() {
       update_wifi_screen();
     else
       update_main_screen();
+    lv_refr_now(NULL);
     last_ui_update = millis();
   }
 

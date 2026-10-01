@@ -640,10 +640,73 @@ void setup() {
 
 static unsigned long last_ui_update = 0;
 static unsigned long last_heartbeat = 0;
+static unsigned long last_tap_ms = 0;
+static bool touch_was_down = false;
 static String serial_buf;
 
 void loop() {
   lv_timer_handler();
+
+  // Manual touch poll — LVGL indev not reliable on CYD (XPT2046 SPI conflict)
+  {
+    uint16_t z = touch.readZ();
+    bool down = (z > CYD_TOUCH_Z_PRESS);
+    if (down && !touch_was_down && (millis() - last_tap_ms > 350))
+    {
+      last_tap_ms = millis();
+      lv_indev_data_t d{};
+      touch.lvglRead(nullptr, &d);
+      uint16_t sx = d.point.x, sy = d.point.y;
+      Serial.printf("[TAP] z=%u x=%u y=%u wifi=%d\n", z, sx, sy, (int)on_wifi);
+
+      if (!on_wifi)
+      {
+        // WiFi icon: top-right of header (x>170, y<40)
+        if (sx >= 170 && sy <= 40)
+        {
+          update_wifi_screen();
+          on_wifi = true;
+          lv_scr_load_anim(scr_wifi, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+        }
+        // Rec button: bottom of screen
+        else if (sy >= 245)
+        {
+          bool connected = (millis() - status.last_rx < 2000);
+          bool busy = status.laser_warming || pending_action != PendingAction::NONE;
+          if (connected && status.sensors_running && !busy)
+          {
+            if (status.recording) {
+              send_cmd("stop_recording");
+              pending_action = PendingAction::STOPPING;
+            } else {
+              send_cmd("start_recording");
+              pending_action = PendingAction::STARTING;
+            }
+            pending_since = millis();
+          }
+        }
+      }
+      else
+      {
+        // WiFi toggle button: bottom of screen
+        if (sy >= 245)
+        {
+          if (status.wifi_mode == "ap")
+            send_cmd("wifi_client");
+          else
+            send_cmd("wifi_ap");
+        }
+        // Header (y<40): back to main screen
+        else if (sy <= 40)
+        {
+          on_wifi = false;
+          update_main_screen();
+          lv_scr_load_anim(scr_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+        }
+      }
+    }
+    touch_was_down = down;
+  }
 
   // Serial input — drain the whole FIFO before yielding
   while (HmiSerial.available())

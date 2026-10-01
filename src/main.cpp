@@ -546,8 +546,7 @@ void update_wifi_screen() {
     // Mode label
     String modeStr = status.wifi_mode;
     modeStr.toUpperCase();
-    String modeLabel = "MODE: " + modeStr;
-    lv_label_set_text(lbl_wifi_mode, modeLabel.c_str());
+    lv_label_set_text(lbl_wifi_mode, ("MODE: " + modeStr).c_str());
     lv_color_t mc = C_DIM;
     if (status.wifi_mode == "client") mc = C_OK;
     else if (status.wifi_mode == "ap") mc = C_WARN;
@@ -556,36 +555,35 @@ void update_wifi_screen() {
     // IP label
     lv_label_set_text(lbl_wifi_ip, status.wifi_ip.isEmpty() ? "" : status.wifi_ip.c_str());
 
-    // QR code: encode "http://<ip>:3000"
+    // QR: only recreate when url changes (avoid 200ms alloc/free loop)
     String qr_url;
-    if (!status.wifi_ip.isEmpty()) {
+    if (!status.wifi_ip.isEmpty())
         qr_url = "http://" + status.wifi_ip + ":3000";
-    } else if (status.wifi_mode == "ap") {
+    else if (status.wifi_mode == "ap")
         qr_url = "http://10.42.0.1:3000";
+
+    static String last_qr_url;
+    if (qr_url != last_qr_url) {
+        last_qr_url = qr_url;
+        if (qr_code) { lv_obj_del(qr_code); qr_code = nullptr; }
+        lv_label_set_text(lbl_qr_hint, "");
+        if (!qr_url.isEmpty()) {
+            qr_code = lv_qrcode_create(scr_wifi, 150, lv_color_hex(0x000000), lv_color_hex(0xffffff));
+            lv_qrcode_update(qr_code, qr_url.c_str(), qr_url.length());
+            lv_obj_align(qr_code, LV_ALIGN_TOP_MID, 0, 90);
+            lv_obj_clear_flag(qr_code, LV_OBJ_FLAG_CLICKABLE);
+        } else {
+            lv_label_set_text(lbl_qr_hint, "No IP assigned");
+        }
     }
 
-    // Remove old QR + hint
-    if (qr_code) { lv_obj_del(qr_code); qr_code = nullptr; }
-    lv_label_set_text(lbl_qr_hint, "");
-
-    if (!qr_url.isEmpty()) {
-      qr_code = lv_qrcode_create(scr_wifi, 150, lv_color_hex(0x000000), lv_color_hex(0xffffff));
-      lv_qrcode_update(qr_code, qr_url.c_str(), qr_url.length());
-      lv_obj_align(qr_code, LV_ALIGN_TOP_MID, 0, 90);
-      lv_obj_clear_flag(qr_code, LV_OBJ_FLAG_CLICKABLE);
-    } else {
-        lv_label_set_text(lbl_qr_hint, "No IP assigned");
-    }
-
-    // Toggle button: in AP mode offer "CONNECT WIFI", otherwise "ENABLE AP"
+    // Toggle button
     if (status.wifi_mode == "ap") {
         lv_label_set_text(lbl_btn_wifi, "CONNECT WIFI");
         lv_obj_set_style_bg_color(btn_wifi_toggle, C_OK, 0);
-        lv_obj_set_style_text_color(lbl_btn_wifi, lv_color_hex(0x000000), 0);
     } else {
         lv_label_set_text(lbl_btn_wifi, "ENABLE AP");
         lv_obj_set_style_bg_color(btn_wifi_toggle, C_WARN, 0);
-        lv_obj_set_style_text_color(lbl_btn_wifi, lv_color_hex(0x000000), 0);
     }
 }
 
@@ -688,4 +686,6 @@ void loop() {
       update_main_screen();
     last_ui_update = millis();
   }
+
+  delay(5); // feed watchdog + yield to UART FIFO
 }

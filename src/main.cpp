@@ -27,6 +27,7 @@ struct Status {
     bool   lidar_ok        = false;
     bool   imu_ok          = false;
     bool   recording       = false;
+    bool laser_warming = false;
     float  disk_gb         = 0.0f;
     int    rec_duration    = 0;
     String bag_name;
@@ -34,6 +35,22 @@ struct Status {
     String wifi_mode       = "disconnected";
     unsigned long last_rx  = 0;
 } status;
+
+// ── Pending button state ──────────────────────────────────────────────────────
+// Gives immediate visual feedback on tap before Pi confirms the action.
+
+enum class PendingAction
+{
+  NONE,
+  STARTING,
+  STOPPING
+};
+static PendingAction pending_action = PendingAction::NONE;
+static unsigned long pending_since = 0;
+// STARTING: 30s enough for rpm=600+laser; warming resets it via laser_warming field
+// STOPPING: 15s enough for bag close+rpm=0
+static constexpr unsigned long PENDING_STARTING_TIMEOUT = 30000;
+static constexpr unsigned long PENDING_STOPPING_TIMEOUT = 15000;
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 void send_cmd(const char *cmd);
@@ -67,10 +84,14 @@ static lv_obj_t *lbl_conn;
 static lv_obj_t *lbl_lidar;
 static lv_obj_t *lbl_imu;
 static lv_obj_t *lbl_disk;
-static lv_obj_t *lbl_rec;
+static lv_obj_t *rec_dot;   // blinking circle indicator
+static lv_obj_t *lbl_rec;   // "REC" text
+static lv_obj_t *lbl_timer; // "00:42" right-aligned
+static lv_obj_t *lbl_bag;
 static lv_obj_t *btn_rec;
 static lv_obj_t *lbl_btn;
 static lv_obj_t *lbl_wifi_icon;
+static bool rec_blink = false;
 
 // WiFi screen widgets
 static lv_obj_t *lbl_wifi_mode;
@@ -93,42 +114,39 @@ static lv_style_t style_screen;
 static lv_style_t style_card;
 static lv_style_t style_label;
 static lv_style_t style_dim;
-static lv_style_t style_btn_rec;
-static lv_style_t style_btn_stop;
 
 void init_styles() {
     lv_style_init(&style_screen);
     lv_style_set_bg_color(&style_screen, C_BG);
+    lv_style_set_bg_opa(&style_screen, LV_OPA_COVER);
+    lv_style_set_border_width(&style_screen, 0);
+    lv_style_set_outline_width(&style_screen, 0);
+    lv_style_set_shadow_width(&style_screen, 0);
+    lv_style_set_pad_all(&style_screen, 0);
 
     lv_style_init(&style_card);
     lv_style_set_bg_color(&style_card, C_CARD);
+    lv_style_set_bg_opa(&style_card, LV_OPA_COVER);
     lv_style_set_border_color(&style_card, lv_color_hex(0x1e1e1e));
     lv_style_set_border_width(&style_card, 1);
+    lv_style_set_outline_width(&style_card, 0);
+    lv_style_set_shadow_width(&style_card, 0);
     lv_style_set_radius(&style_card, 4);
     lv_style_set_pad_all(&style_card, 10);
 
     lv_style_init(&style_label);
     lv_style_set_text_color(&style_label, C_TEXT);
+    lv_style_set_outline_width(&style_label, 0);
 
     lv_style_init(&style_dim);
     lv_style_set_text_color(&style_dim, C_DIM);
-
-    lv_style_init(&style_btn_rec);
-    lv_style_set_bg_color(&style_btn_rec, C_OK);
-    lv_style_set_text_color(&style_btn_rec, lv_color_hex(0x000000));
-    lv_style_set_radius(&style_btn_rec, 6);
-    lv_style_set_border_width(&style_btn_rec, 0);
-
-    lv_style_init(&style_btn_stop);
-    lv_style_set_bg_color(&style_btn_stop, C_DEAD);
-    lv_style_set_text_color(&style_btn_stop, C_TEXT);
-    lv_style_set_radius(&style_btn_stop, 6);
-    lv_style_set_border_width(&style_btn_stop, 0);
+    lv_style_set_outline_width(&style_dim, 0);
 }
 
 // ── Protocol ──────────────────────────────────────────────────────────────────
 
-void send_cmd(const char *cmd) {
+void send_cmd(const char *cmd)
+{
   JsonDocument doc;
   doc["cmd"] = cmd;
   char buf[128];
@@ -139,127 +157,180 @@ void send_cmd(const char *cmd) {
   HmiSerial.flush();
 }
 
-void handle_json(const String &line) {
+void handle_json(const String &line)
+{
+  // Serial.println("[RX] len=" + String(line.length()) + " " + line.substring(0, 80));
   JsonDocument doc;
-  if (deserializeJson(doc, line))
+  DeserializationError err = deserializeJson(doc, line);
+  if (err)
+  {
+    Serial.println("[ERR] parse: " + String(err.c_str()));
     return;
+  }
   if (!doc["sensors_running"].is<bool>())
+  {
+    Serial.println("[ERR] no sensors_running in JSON");
     return;
+  }
   status.sensors_running = doc["sensors_running"] | false;
   status.lidar_hz = doc["lidar_hz"] | 0.0f;
   status.imu_hz = doc["imu_hz"] | 0.0f;
   status.lidar_ok = doc["lidar_ok"] | false;
   status.imu_ok = doc["imu_ok"] | false;
   status.recording = doc["recording"] | false;
+  status.laser_warming = doc["laser_warming"] | false;
   status.disk_gb = doc["disk_gb"] | 0.0f;
   status.rec_duration = doc["rec_duration"] | 0;
   status.bag_name = doc["bag_name"] | "";
   status.wifi_ip = doc["wifi_ip"] | "";
   status.wifi_mode = doc["wifi_mode"] | "disconnected";
   status.last_rx = millis();
+
+  // Serial.println("[OK] sr=" + String(status.sensors_running) +
+  //                " lidar=" + String(status.lidar_hz, 1) +
+  //                " imu=" + String(status.imu_hz, 1) +
+  //                " rec=" + String(status.recording));
+
+  // Resolve pending state when Pi confirms the action
+  if (pending_action == PendingAction::STARTING &&
+      (status.recording || status.laser_warming))
+  {
+    pending_action = PendingAction::NONE;
+  }
+  if (pending_action == PendingAction::STOPPING && !status.recording)
+  {
+    pending_action = PendingAction::NONE;
+  }
 }
 
 // ── Main screen ───────────────────────────────────────────────────────────────
 
-void build_main_screen() {
-    scr_main = lv_obj_create(nullptr);
-    lv_obj_add_style(scr_main, &style_screen, 0);
-    lv_obj_set_scrollbar_mode(scr_main, LV_SCROLLBAR_MODE_OFF);
+void build_main_screen()
+{
+  scr_main = lv_obj_create(nullptr);
+  lv_obj_add_style(scr_main, &style_screen, 0);
+  lv_obj_set_scrollbar_mode(scr_main, LV_SCROLLBAR_MODE_OFF);
 
-    // Header bar
-    lv_obj_t *hdr = lv_obj_create(scr_main);
-    lv_obj_set_size(hdr, DISP_W, 36);
-    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_add_style(hdr, &style_card, 0);
-    lv_obj_set_style_radius(hdr, 0, 0);
-    lv_obj_set_style_border_width(hdr, 0, 0);
-    lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_width(hdr, 1, 0);
-    lv_obj_set_style_pad_all(hdr, 0, 0);
+  // Header bar
+  lv_obj_t *hdr = lv_obj_create(scr_main);
+  lv_obj_set_size(hdr, DISP_W, 36);
+  lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_add_style(hdr, &style_card, 0);
+  lv_obj_set_style_radius(hdr, 0, 0);
+  lv_obj_set_style_border_width(hdr, 0, 0);
+  lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, 0);
+  lv_obj_set_style_border_width(hdr, 1, 0);
+  lv_obj_set_style_pad_all(hdr, 0, 0);
 
-    lbl_title = lv_label_create(hdr);
-    lv_label_set_text(lbl_title, "PULSE");
-    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_title, C_DIM, 0);
-    lv_obj_set_style_text_letter_space(lbl_title, 4, 0);
-    lv_obj_align(lbl_title, LV_ALIGN_LEFT_MID, 12, 0);
+  lbl_title = lv_label_create(hdr);
+  lv_label_set_text(lbl_title, "PULSE");
+  lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_title, C_DIM, 0);
+  lv_obj_set_style_text_letter_space(lbl_title, 4, 0);
+  lv_obj_set_style_outline_width(lbl_title, 0, 0);
+  lv_obj_align(lbl_title, LV_ALIGN_LEFT_MID, 12, 0);
 
-    // WiFi icon (top-right of header) — tap navigates to WiFi screen
-    lbl_wifi_icon = lv_label_create(hdr);
-    lv_label_set_text(lbl_wifi_icon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(lbl_wifi_icon, C_DIM, 0);
-    lv_obj_align(lbl_wifi_icon, LV_ALIGN_RIGHT_MID, -12, 0);
-    lv_obj_add_flag(lbl_wifi_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(lbl_wifi_icon, [](lv_event_t *e)
-                        {
-        if (lv_event_get_code(e) != LV_EVENT_CLICKED || touch.clickSuppressed()) return;
-        update_wifi_screen();
-        lv_scr_load_anim(scr_wifi, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
-        on_wifi = true; }, LV_EVENT_CLICKED, nullptr);
+  // WiFi icon (top-right of header) — tap navigates to WiFi screen
+  lbl_wifi_icon = lv_label_create(hdr);
+  lv_label_set_text(lbl_wifi_icon, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_color(lbl_wifi_icon, C_DIM, 0);
+  lv_obj_align(lbl_wifi_icon, LV_ALIGN_RIGHT_MID, -12, 0);
+  lv_obj_add_flag(lbl_wifi_icon, LV_OBJ_FLAG_CLICKABLE);
+  // Navigation handled by manual touch poll in loop() — LVGL indev bypassed
+  lv_obj_add_event_cb(lbl_wifi_icon, [](lv_event_t *e) {}, LV_EVENT_CLICKED, nullptr);
 
-    // Connection dot
-    lbl_conn = lv_label_create(hdr);
-    lv_label_set_text(lbl_conn, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_color(lbl_conn, C_DEAD, 0);
-    lv_obj_align(lbl_conn, LV_ALIGN_RIGHT_MID, -40, 0);
+  // Connection dot
+  lbl_conn = lv_label_create(hdr);
+  lv_label_set_text(lbl_conn, LV_SYMBOL_CLOSE);
+  lv_obj_set_style_text_color(lbl_conn, C_DEAD, 0);
+  lv_obj_align(lbl_conn, LV_ALIGN_RIGHT_MID, -40, 0);
 
-    // Sensors card
-    lv_obj_t *card_s = lv_obj_create(scr_main);
-    lv_obj_set_size(card_s, DISP_W - 12, 102);
-    lv_obj_align(card_s, LV_ALIGN_TOP_MID, 0, 42);
-    lv_obj_add_style(card_s, &style_card, 0);
+  // Sensors card
+  lv_obj_t *card_s = lv_obj_create(scr_main);
+  lv_obj_set_size(card_s, DISP_W - 12, 102);
+  lv_obj_align(card_s, LV_ALIGN_TOP_MID, 0, 42);
+  lv_obj_add_style(card_s, &style_card, 0);
 
-    lv_obj_t *lbl_s_title = lv_label_create(card_s);
-    lv_label_set_text(lbl_s_title, "SENSORS");
-    lv_obj_set_style_text_color(lbl_s_title, C_DIM, 0);
-    lv_obj_set_style_text_font(lbl_s_title, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_letter_space(lbl_s_title, 2, 0);
-    lv_obj_align(lbl_s_title, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_t *lbl_s_title = lv_label_create(card_s);
+  lv_label_set_text(lbl_s_title, "SENSORS");
+  lv_obj_set_style_text_color(lbl_s_title, C_DIM, 0);
+  lv_obj_set_style_text_font(lbl_s_title, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_letter_space(lbl_s_title, 2, 0);
+  lv_obj_align(lbl_s_title, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    lbl_lidar = lv_label_create(card_s);
-    lv_label_set_text(lbl_lidar, "LIDAR   --.- Hz");
-    lv_obj_set_style_text_font(lbl_lidar, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_lidar, C_DIM, 0);
-    lv_obj_align(lbl_lidar, LV_ALIGN_TOP_LEFT, 0, 18);
+  lbl_lidar = lv_label_create(card_s);
+  lv_label_set_text(lbl_lidar, "LIDAR   --.- Hz");
+  lv_obj_set_style_text_font(lbl_lidar, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_lidar, C_DIM, 0);
+  lv_obj_align(lbl_lidar, LV_ALIGN_TOP_LEFT, 0, 18);
 
-    lbl_imu = lv_label_create(card_s);
-    lv_label_set_text(lbl_imu, "IMU    ---.-- Hz");
-    lv_obj_set_style_text_font(lbl_imu, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_imu, C_DIM, 0);
-    lv_obj_align(lbl_imu, LV_ALIGN_TOP_LEFT, 0, 40);
+  lbl_imu = lv_label_create(card_s);
+  lv_label_set_text(lbl_imu, "IMU    ---.-- Hz");
+  lv_obj_set_style_text_font(lbl_imu, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_imu, C_DIM, 0);
+  lv_obj_align(lbl_imu, LV_ALIGN_TOP_LEFT, 0, 40);
 
-    lbl_disk = lv_label_create(card_s);
-    lv_label_set_text(lbl_disk, "DISK  -----  GB");
-    lv_obj_set_style_text_font(lbl_disk, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(lbl_disk, C_DIM, 0);
-    lv_obj_align(lbl_disk, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lbl_disk = lv_label_create(card_s);
+  lv_label_set_text(lbl_disk, "DISK  -----  GB");
+  lv_obj_set_style_text_font(lbl_disk, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_disk, C_DIM, 0);
+  lv_obj_align(lbl_disk, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
-    // Rec info
-    lbl_rec = lv_label_create(scr_main);
-    lv_label_set_text(lbl_rec, "");
-    lv_obj_set_style_text_color(lbl_rec, C_DEAD, 0);
-    lv_obj_set_style_text_font(lbl_rec, &lv_font_montserrat_16, 0);
-    lv_obj_align(lbl_rec, LV_ALIGN_TOP_MID, 0, 142);
-    lv_obj_set_width(lbl_rec, DISP_W - 12);
-    lv_label_set_long_mode(lbl_rec, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  // Recording area — gap between sensors card (y=144) and button (y=250)
+  // Row 1 y=160: [●] REC (left)    00:42 (right, fixed anchor)
+  // Row 2 y=194: bag name scrolling
 
-    // Record button
-    btn_rec = lv_btn_create(scr_main);
-    lv_obj_set_size(btn_rec, DISP_W - 24, 58);
-    lv_obj_align(btn_rec, LV_ALIGN_BOTTOM_MID, 0, -12);
-    lv_obj_add_style(btn_rec, &style_btn_rec, 0);
+  // Dot: small LVGL circle (no font dependency)
+  rec_dot = lv_obj_create(scr_main);
+  lv_obj_remove_style_all(rec_dot); // clear default theme styles (shadow, border, outline)
+  lv_obj_set_size(rec_dot, 12, 12);
+  lv_obj_set_style_radius(rec_dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(rec_dot, lv_color_hex(0xff0000), 0);
+  lv_obj_set_style_bg_opa(rec_dot, LV_OPA_COVER, 0);
+  lv_obj_align(rec_dot, LV_ALIGN_TOP_LEFT, 14, 164);
+  lv_obj_add_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
 
-    lbl_btn = lv_label_create(btn_rec);
-    lv_label_set_text(lbl_btn, "START RECORD");
-    lv_obj_set_style_text_font(lbl_btn, &lv_font_montserrat_20, 0);
-    lv_obj_center(lbl_btn);
+  // "REC" label — fixed left position, never moves
+  lbl_rec = lv_label_create(scr_main);
+  lv_label_set_text(lbl_rec, "");
+  lv_obj_set_style_text_color(lbl_rec, C_TEXT, 0);
+  lv_obj_set_style_text_font(lbl_rec, &lv_font_montserrat_20, 0);
+  lv_obj_align(lbl_rec, LV_ALIGN_TOP_LEFT, 32, 160);
 
-    lv_obj_add_event_cb(btn_rec, [](lv_event_t *e)
-                        {
-        if (lv_event_get_code(e) != LV_EVENT_CLICKED || touch.clickSuppressed()) return;
-        bool connected = (millis() - status.last_rx < 2000);
-        if (connected && status.sensors_running)
-            send_cmd(status.recording ? "stop_recording" : "start_recording"); }, LV_EVENT_CLICKED, nullptr);
+  // Timer — fixed RIGHT position so digits don't shift the layout
+  lbl_timer = lv_label_create(scr_main);
+  lv_label_set_text(lbl_timer, "");
+  lv_obj_set_style_text_color(lbl_timer, C_TEXT, 0);
+  lv_obj_set_style_text_font(lbl_timer, &lv_font_montserrat_20, 0);
+  lv_obj_align(lbl_timer, LV_ALIGN_TOP_RIGHT, -14, 160);
+
+  // Bag name — scrolling, dim
+  lbl_bag = lv_label_create(scr_main);
+  lv_label_set_text(lbl_bag, "");
+  lv_obj_set_style_text_color(lbl_bag, C_DIM, 0);
+  lv_obj_set_style_text_font(lbl_bag, &lv_font_montserrat_12, 0);
+  lv_obj_align(lbl_bag, LV_ALIGN_TOP_MID, 0, 194);
+  lv_obj_set_width(lbl_bag, DISP_W - 24);
+  lv_label_set_long_mode(lbl_bag, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+  // Record button
+  btn_rec = lv_btn_create(scr_main);
+  lv_obj_remove_style_all(btn_rec); // strip default LVGL theme so local styles always win
+  lv_obj_set_size(btn_rec, DISP_W - 24, 58);
+  lv_obj_align(btn_rec, LV_ALIGN_BOTTOM_MID, 0, -12);
+  lv_obj_set_style_radius(btn_rec, 6, 0);
+  lv_obj_set_style_border_width(btn_rec, 0, 0);
+  lv_obj_set_style_bg_opa(btn_rec, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(btn_rec, C_OK, 0);
+
+  lbl_btn = lv_label_create(btn_rec);
+  lv_label_set_text(lbl_btn, "START RECORD");
+  lv_obj_set_style_text_font(lbl_btn, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(lbl_btn, lv_color_hex(0x000000), 0);
+  lv_obj_center(lbl_btn);
+
+  // Button click handled by manual touch poll in loop() (LVGL indev bypassed)
+  lv_obj_add_event_cb(btn_rec, [](lv_event_t *e) {}, LV_EVENT_CLICKED, nullptr);
 }
 
 // ── WiFi screen ───────────────────────────────────────────────────────────────
@@ -320,11 +391,8 @@ void build_wifi_screen() {
     for (uint32_t i = 0; i < lv_obj_get_child_cnt(scr_wifi); i++)
       lv_obj_clear_flag(lv_obj_get_child(scr_wifi, i), LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(scr_wifi, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(scr_wifi, [](lv_event_t *e)
-                        {
-        if (lv_event_get_code(e) != LV_EVENT_CLICKED || touch.clickSuppressed()) return;
-        lv_scr_load_anim(scr_main, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 250, 0, false);
-        on_wifi = false; }, LV_EVENT_CLICKED, nullptr);
+    // Navigation handled by manual touch poll in loop() — LVGL indev bypassed
+    lv_obj_add_event_cb(scr_wifi, [](lv_event_t *e) {}, LV_EVENT_CLICKED, nullptr);
 }
 
 // ── Screen updaters ───────────────────────────────────────────────────────────
@@ -348,9 +416,13 @@ void update_main_screen() {
         lv_label_set_text(lbl_lidar, "LIDAR   --.- Hz");
         lv_label_set_text(lbl_imu,   "IMU    ---.-- Hz");
         lv_label_set_text(lbl_disk,  "DISK  -----  GB");
+        lv_obj_add_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(lbl_rec,   "");
+        lv_label_set_text(lbl_timer, "");
+        lv_label_set_text(lbl_bag, "");
         lv_label_set_text(lbl_btn, "WAITING...");
         lv_obj_set_style_bg_color(btn_rec, lv_color_hex(0x2a2a2a), 0);
+        lv_obj_set_style_text_color(lbl_btn, C_DIM, 0);
         return;
     }
 
@@ -373,27 +445,63 @@ void update_main_screen() {
     lv_label_set_text(lbl_disk, buf);
     lv_obj_set_style_text_color(lbl_disk, dc, 0);
 
-    // Rec timer
+    // Rec timer + bag name
     if (status.recording) {
-        int m = status.rec_duration / 60, s = status.rec_duration % 60;
-        snprintf(buf, sizeof(buf), "● REC  %02d:%02d", m, s);
-        lv_label_set_text(lbl_rec, buf);
+      rec_blink = !rec_blink;
+      if (rec_blink)
+        lv_obj_clear_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
+      else
+        lv_obj_add_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(lbl_rec, "REC");
+      int m = status.rec_duration / 60, s = status.rec_duration % 60;
+      snprintf(buf, sizeof(buf), "%02d:%02d", m, s);
+      lv_label_set_text(lbl_timer, buf);
+      lv_label_set_text(lbl_bag, status.bag_name.isEmpty() ? "" : status.bag_name.c_str());
     } else {
-        lv_label_set_text(lbl_rec, "");
+      lv_obj_add_flag(rec_dot, LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(lbl_rec, "");
+      lv_label_set_text(lbl_timer, "");
+      lv_label_set_text(lbl_bag, "");
     }
 
-    // Button
+    // Expire pending if Pi doesn't respond within timeout
+    unsigned long pending_elapsed = millis() - pending_since;
+    if (pending_action == PendingAction::STARTING &&
+        pending_elapsed > PENDING_STARTING_TIMEOUT)
+    {
+      pending_action = PendingAction::NONE;
+    }
+    if (pending_action == PendingAction::STOPPING &&
+        pending_elapsed > PENDING_STOPPING_TIMEOUT)
+    {
+      pending_action = PendingAction::NONE;
+    }
+
+    // Button — priority: no sensors > warming/starting > stopping/recording > idle
     if (!status.sensors_running) {
         lv_label_set_text(lbl_btn, "WAITING...");
         lv_obj_set_style_bg_color(btn_rec, lv_color_hex(0x2a2a2a), 0);
-    } else if (status.recording) {
-        lv_label_set_text(lbl_btn, "STOP RECORD");
-        lv_obj_set_style_bg_color(btn_rec, C_DEAD, 0);
-        lv_obj_set_style_text_color(lbl_btn, C_TEXT, 0);
-    } else {
-        lv_label_set_text(lbl_btn, "START RECORD");
-        lv_obj_set_style_bg_color(btn_rec, C_OK, 0);
-        lv_obj_set_style_text_color(lbl_btn, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_text_color(lbl_btn, C_DIM, 0);
+    }
+    else if (status.laser_warming || pending_action == PendingAction::STARTING)
+    {
+      const char *lbl = status.laser_warming ? "WARMING UP..." : "STARTING...";
+      lv_label_set_text(lbl_btn, lbl);
+      lv_obj_set_style_bg_color(btn_rec, C_WARN, 0);
+      lv_obj_set_style_text_color(lbl_btn, lv_color_hex(0x000000), 0);
+    }
+    else if (status.recording || pending_action == PendingAction::STOPPING)
+    {
+      const char *lbl = (pending_action == PendingAction::STOPPING) ? "STOPPING..." : "STOP RECORD";
+      lv_label_set_text(lbl_btn, lbl);
+      lv_obj_set_style_bg_color(btn_rec, C_DEAD, 0);
+      lv_obj_set_style_text_color(lbl_btn, C_TEXT, 0);
+    }
+    else
+    {
+      lv_label_set_text(lbl_btn, "START RECORD");
+      lv_obj_set_style_bg_color(btn_rec, C_OK, 0);
+      lv_obj_set_style_text_color(lbl_btn, lv_color_hex(0x000000), 0);
     }
 }
 
@@ -444,7 +552,13 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
   tft.init();
+  tft.invertDisplay(false);
   tft.setRotation(0);
+  // ST7789 physical pixel order is BGR; setRotation() overwrites MADCTL without
+  // the BGR bit when TFT_MAD_COLOR_ORDER resolves to 0x00 at compile time.
+  // Write MADCTL manually: 0x08 = BGR only, portrait 240x320.
+  tft.writecommand(0x36);
+  tft.writedata(0x08);
   tft.fillScreen(TFT_BLACK);
 
   // Touch: XPT2046 on its own SPI bus; NVS calibration (corner-tap on first
@@ -462,7 +576,8 @@ void setup() {
   disp_drv.ver_res = DISP_H;
   disp_drv.flush_cb = lvgl_flush;
   disp_drv.draw_buf = &draw_buf;
-  lv_disp_drv_register(&disp_drv);
+  lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
+  lv_disp_set_theme(disp, NULL); // disable default theme — all styles managed manually
 
   static lv_indev_drv_t indev_drv;
   lv_indev_drv_init(&indev_drv);
@@ -479,40 +594,123 @@ void setup() {
 }
 
 static unsigned long last_ui_update = 0;
-static String         serial_buf;
+static unsigned long wifi_screen_entered = 0; // millis() when WiFi screen opened
+static unsigned long last_tap_ms = 0;         // cooldown: ignore re-taps within 350ms
+static bool touch_was_down = false;
+static String serial_buf;
+
+// Button region on 240×320 screen (LV_ALIGN_BOTTOM_MID, size 216×58, offset y=-12)
+static constexpr int BTN_X0 = 12, BTN_X1 = 228;
+static constexpr int BTN_Y0 = 250, BTN_Y1 = 308;
 
 void loop() {
-    // LVGL tick
-    lv_timer_handler();
-    delay(5);
+  lv_timer_handler();
 
-    // Serial input
-    while (HmiSerial.available()) {
-        char c = (char)HmiSerial.read();
-        if (c == '\r') continue;
-        if (c == '\n') {
-            serial_buf.trim();
-            if (serial_buf.length() > 0)
-            {
-              if (serial_buf.charAt(0) == '{')
-                handle_json(serial_buf);
-              else
-                Serial.println("[HMI] " + serial_buf); // non-JSON line → log
-            }
-            serial_buf = "";
-        } else {
-            serial_buf += c;
-            if (serial_buf.length() > 256)
-            { // guard against garbage stream
-              Serial.println("[HMI] " + serial_buf);
-              serial_buf = "";
-            }
+  // Touch poll — every loop iteration to catch short taps; cooldown prevents doubles
+  {
+    uint16_t z_raw = touch.readZ();
+    bool down = (z_raw > CYD_TOUCH_Z_PRESS);
+    if (down && !touch_was_down && (millis() - last_tap_ms > 350))
+    {
+      last_tap_ms = millis();
+      lv_indev_data_t tmp{};
+      touch.lvglRead(nullptr, &tmp);
+      uint16_t sx = tmp.point.x, sy = tmp.point.y;
+      Serial.printf("[TAP] z=%u x=%u y=%u\n", z_raw, sx, sy);
+      if (!on_wifi)
+      {
+        if (sx >= 170 && sy <= 40)
+        {
+          update_wifi_screen();
+          lv_obj_add_flag(scr_main, LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(scr_wifi, LV_OBJ_FLAG_HIDDEN);
+          lv_scr_load(scr_wifi);
+          lv_refr_now(NULL);
+          on_wifi = true;
+          wifi_screen_entered = millis();
         }
+        else if (sx >= BTN_X0 && sx <= BTN_X1 && sy >= BTN_Y0 && sy <= BTN_Y1)
+        {
+          bool connected = (millis() - status.last_rx < 2000);
+          bool busy = status.laser_warming ||
+                      pending_action != PendingAction::NONE;
+          if (connected && status.sensors_running && !busy)
+          {
+            if (status.recording)
+            {
+              send_cmd("stop_recording");
+              pending_action = PendingAction::STOPPING;
+            }
+            else
+            {
+              send_cmd("start_recording");
+              pending_action = PendingAction::STARTING;
+            }
+            pending_since = millis();
+            update_main_screen();
+            lv_obj_invalidate(scr_main);
+            lv_timer_handler();
+          }
+        }
+      }
+      else
+      {
+        if (millis() - wifi_screen_entered > 600)
+        {
+          on_wifi = false;
+          lv_obj_add_flag(scr_wifi, LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(scr_main, LV_OBJ_FLAG_HIDDEN);
+          update_main_screen();
+          lv_scr_load(scr_main);
+          lv_refr_now(NULL);
+        }
+      }
     }
+    touch_was_down = down;
+  }
 
-    // Update screen ~2 Hz
-    if (millis() - last_ui_update > 500) {
-        if (!on_wifi) update_main_screen();
-        last_ui_update = millis();
+  // Serial input — drain the whole FIFO before yielding
+  while (HmiSerial.available())
+  {
+    char c = (char)HmiSerial.read();
+    if (c == '\r')
+      continue;
+    if (c == '\n')
+    {
+      serial_buf.trim();
+      if (serial_buf.length() > 0)
+      {
+        if (serial_buf.charAt(0) == '{')
+        {
+          handle_json(serial_buf);
+        }
+        else
+        {
+          Serial.println("[RAW] " + serial_buf);
+        }
+      }
+      serial_buf = "";
     }
+    else
+    {
+      serial_buf += c;
+      if (serial_buf.length() > 512)
+      {
+        Serial.println("[HMI] overflow: " + serial_buf.substring(0, 40));
+        serial_buf = "";
+      }
+    }
+  }
+
+  // Update screen at 200 ms + force hardware flush
+  if (millis() - last_ui_update > 200)
+  {
+    if (!on_wifi)
+    {
+      update_main_screen();
+      lv_obj_invalidate(scr_main);
+      lv_refr_now(NULL);
+    }
+    last_ui_update = millis();
+  }
 }

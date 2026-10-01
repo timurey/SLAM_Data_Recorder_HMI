@@ -11,7 +11,7 @@
 
 /* Color depth */
 #define LV_COLOR_DEPTH     16
-#define LV_COLOR_16_SWAP   1   /* byte-swap for SPI displays */
+#define LV_COLOR_16_SWAP 0
 
 /* Memory */
 #define LV_MEM_CUSTOM      0

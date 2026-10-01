@@ -97,7 +97,9 @@ static bool rec_blink = false;
 static lv_obj_t *lbl_wifi_mode;
 static lv_obj_t *lbl_wifi_ip;
 static lv_obj_t *lbl_qr_hint;
-static lv_obj_t *qr_code    = nullptr;
+static lv_obj_t *qr_code       = nullptr;
+static lv_obj_t *btn_wifi_toggle;
+static lv_obj_t *lbl_btn_wifi;
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
@@ -372,27 +374,28 @@ void build_wifi_screen() {
     lv_obj_set_style_text_color(lbl_wifi_ip, C_TEXT, 0);
     lv_obj_align(lbl_wifi_ip, LV_ALIGN_TOP_MID, 0, 68);
 
-    // QR code placeholder (will be replaced in update_wifi_screen)
+    // QR code placeholder (replaced in update_wifi_screen)
     lbl_qr_hint = lv_label_create(scr_wifi);
     lv_label_set_text(lbl_qr_hint, "No IP assigned");
     lv_obj_set_style_text_color(lbl_qr_hint, C_DIM, 0);
     lv_obj_set_style_text_font(lbl_qr_hint, &lv_font_montserrat_14, 0);
-    lv_obj_align(lbl_qr_hint, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_align(lbl_qr_hint, LV_ALIGN_TOP_MID, 0, 110);
 
-    // Back hint
-    lv_obj_t *lbl_back = lv_label_create(scr_wifi);
-    lv_label_set_text(lbl_back, "Tap anywhere to go back");
-    lv_obj_set_style_text_color(lbl_back, C_DIM, 0);
-    lv_obj_set_style_text_font(lbl_back, &lv_font_montserrat_12, 0);
-    lv_obj_align(lbl_back, LV_ALIGN_BOTTOM_MID, 0, -12);
+    // AP / Client toggle button (bottom, same geometry as main rec button)
+    btn_wifi_toggle = lv_btn_create(scr_wifi);
+    lv_obj_remove_style_all(btn_wifi_toggle);
+    lv_obj_set_size(btn_wifi_toggle, DISP_W - 24, 50);
+    lv_obj_align(btn_wifi_toggle, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_set_style_radius(btn_wifi_toggle, 6, 0);
+    lv_obj_set_style_border_width(btn_wifi_toggle, 0, 0);
+    lv_obj_set_style_bg_opa(btn_wifi_toggle, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(btn_wifi_toggle, C_WARN, 0);
 
-    // Whole screen is the "back" button; children must not swallow the clicks
-    // (LVGL objects are clickable by default).
-    for (uint32_t i = 0; i < lv_obj_get_child_cnt(scr_wifi); i++)
-      lv_obj_clear_flag(lv_obj_get_child(scr_wifi, i), LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(scr_wifi, LV_OBJ_FLAG_CLICKABLE);
-    // Navigation handled by manual touch poll in loop() — LVGL indev bypassed
-    lv_obj_add_event_cb(scr_wifi, [](lv_event_t *e) {}, LV_EVENT_CLICKED, nullptr);
+    lbl_btn_wifi = lv_label_create(btn_wifi_toggle);
+    lv_label_set_text(lbl_btn_wifi, "ENABLE AP");
+    lv_obj_set_style_text_font(lbl_btn_wifi, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_btn_wifi, lv_color_hex(0x000000), 0);
+    lv_obj_center(lbl_btn_wifi);
 }
 
 // ── Screen updaters ───────────────────────────────────────────────────────────
@@ -532,13 +535,23 @@ void update_wifi_screen() {
     lv_label_set_text(lbl_qr_hint, "");
 
     if (!qr_url.isEmpty()) {
-      // QR code: 200x200 (max size that fits between the labels), centered
-      qr_code = lv_qrcode_create(scr_wifi, 200, lv_color_hex(0x000000), lv_color_hex(0xffffff));
+      qr_code = lv_qrcode_create(scr_wifi, 150, lv_color_hex(0x000000), lv_color_hex(0xffffff));
       lv_qrcode_update(qr_code, qr_url.c_str(), qr_url.length());
-      lv_obj_align(qr_code, LV_ALIGN_CENTER, 0, 14);
-      lv_obj_clear_flag(qr_code, LV_OBJ_FLAG_CLICKABLE); // let taps reach the screen
+      lv_obj_align(qr_code, LV_ALIGN_TOP_MID, 0, 90);
+      lv_obj_clear_flag(qr_code, LV_OBJ_FLAG_CLICKABLE);
     } else {
         lv_label_set_text(lbl_qr_hint, "No IP assigned");
+    }
+
+    // Toggle button: in AP mode offer "CONNECT WIFI", otherwise "ENABLE AP"
+    if (status.wifi_mode == "ap") {
+        lv_label_set_text(lbl_btn_wifi, "CONNECT WIFI");
+        lv_obj_set_style_bg_color(btn_wifi_toggle, C_OK, 0);
+        lv_obj_set_style_text_color(lbl_btn_wifi, lv_color_hex(0x000000), 0);
+    } else {
+        lv_label_set_text(lbl_btn_wifi, "ENABLE AP");
+        lv_obj_set_style_bg_color(btn_wifi_toggle, C_WARN, 0);
+        lv_obj_set_style_text_color(lbl_btn_wifi, lv_color_hex(0x000000), 0);
     }
 }
 
@@ -599,9 +612,12 @@ static unsigned long last_tap_ms = 0;         // cooldown: ignore re-taps within
 static bool touch_was_down = false;
 static String serial_buf;
 
-// Button region on 240×320 screen (LV_ALIGN_BOTTOM_MID, size 216×58, offset y=-12)
+// Main screen: rec button region (LV_ALIGN_BOTTOM_MID, 216×58, y=-12)
 static constexpr int BTN_X0 = 12, BTN_X1 = 228;
 static constexpr int BTN_Y0 = 250, BTN_Y1 = 308;
+// WiFi screen: toggle button region (LV_ALIGN_BOTTOM_MID, 216×50, y=-12)
+static constexpr int WIFI_BTN_X0 = 12, WIFI_BTN_X1 = 228;
+static constexpr int WIFI_BTN_Y0 = 258, WIFI_BTN_Y1 = 308;
 
 void loop() {
   lv_timer_handler();
@@ -655,7 +671,17 @@ void loop() {
       }
       else
       {
-        if (millis() - wifi_screen_entered > 600)
+        bool in_wifi_btn = (sx >= WIFI_BTN_X0 && sx <= WIFI_BTN_X1 &&
+                            sy >= WIFI_BTN_Y0 && sy <= WIFI_BTN_Y1);
+        if (in_wifi_btn)
+        {
+          // Send WiFi mode toggle command to Pi
+          if (status.wifi_mode == "ap")
+            send_cmd("wifi_client");
+          else
+            send_cmd("wifi_ap");
+        }
+        else if (millis() - wifi_screen_entered > 600)
         {
           on_wifi = false;
           lv_obj_add_flag(scr_wifi, LV_OBJ_FLAG_HIDDEN);

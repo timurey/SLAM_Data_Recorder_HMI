@@ -639,6 +639,7 @@ void setup() {
 }
 
 static unsigned long last_ui_update = 0;
+static unsigned long last_heartbeat = 0;
 static String serial_buf;
 
 void loop() {
@@ -653,6 +654,7 @@ void loop() {
     if (c == '\n')
     {
       serial_buf.trim();
+      Serial.printf("[RX] len=%u: %s\n", serial_buf.length(), serial_buf.substring(0, 60).c_str());
       if (serial_buf.length() > 0)
       {
         if (serial_buf.charAt(0) == '{')
@@ -685,6 +687,12 @@ void loop() {
     else
       update_main_screen();
     last_ui_update = millis();
+  }
+
+  if (millis() - last_heartbeat > 5000) {
+    Serial.printf("[HB] uptime=%lus rx=%lums on_wifi=%d sensors=%d\n",
+        millis()/1000, millis() - status.last_rx, (int)on_wifi, (int)status.sensors_running);
+    last_heartbeat = millis();
   }
 
   delay(5); // feed watchdog + yield to UART FIFO
